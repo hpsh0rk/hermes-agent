@@ -3708,18 +3708,37 @@ class FeishuAdapter(BasePlatformAdapter):
             chat_id=chat_id, msg_type=msg_type, payload=payload, reply_to=reply_to, metadata=metadata,
         )
 
-    async def _fetch_last_message_in_thread(self, thread_id: str) -> Optional[str]:
-        """Fetch the last message_id in a thread for reply-based routing."""
+    async def _reply_in_thread(self, anchor_message_id: str, *, msg_type: str, payload: str) -> Any:
+        """Reply into the anchor's topic (``reply_in_thread=True``)."""
+        body = self._build_reply_message_body(
+            content=payload, msg_type=msg_type, reply_in_thread=True, uuid_value=str(uuid.uuid4()),
+        )
+        request = self._build_reply_message_request(anchor_message_id, body)
+        return await self._run_blocking(self._client.im.v1.message.reply, request)
+
+    async def _fetch_last_message_in_thread(self, thread_id: str, *, exclude: Optional[str] = None) -> Optional[str]:
+        """Newest message_id in a topic, used as the reply anchor for anchorless sends.
+
+        ``sort_type=ByCreateTimeDesc`` is load-bearing: the list API defaults to
+        ``ByCreateTimeAsc``, so a bare ``page_size=1`` returned the topic's OLDEST message —
+        an anchor far likelier to have been withdrawn, which the reply API then rejects.
+        ``exclude`` skips a known-bad anchor when re-anchoring after such a rejection.
+        """
         if not self._client or not thread_id:
             return None
         try:
             from lark_oapi.api.im.v1 import ListMessageRequest
-            request = ListMessageRequest.builder().container_id_type("thread").container_id(thread_id).page_size(1).build()
+            request = _sdk_build(
+                ListMessageRequest, container_id_type="thread", container_id=thread_id,
+                sort_type="ByCreateTimeDesc", page_size=5 if exclude else 1,
+            )
             response = await self._run_blocking(self._client.im.v1.message.list, request)
             if self._response_succeeded(response):
-                items = getattr(getattr(response, "data", None), "items", None)
-                if items and len(items) > 0:
-                    return getattr(items[0], "message_id", None)
+                items = getattr(getattr(response, "data", None), "items", None) or []
+                for item in items:
+                    message_id = getattr(item, "message_id", None)
+                    if message_id and message_id != exclude:
+                        return message_id
         except Exception as exc:
             logger.debug("[Feishu] Failed to fetch last message in thread %s: %s", thread_id, exc)
         return None
@@ -3736,9 +3755,37 @@ class FeishuAdapter(BasePlatformAdapter):
             request = self._build_reply_message_request(effective_reply_to, body)
             return await self._run_blocking(self._client.im.v1.message.reply, request)
         if thread_id:
-            # reply→create fallback inside a topic: thread_id as receive_id keeps it in the topic.
-            receive_id, receive_id_type = thread_id, "thread_id"
-        elif chat_id.startswith("feishu_user_id:"):
+            # The create API accepts ONLY open_id/union_id/user_id/email/chat_id as
+            # receive_id_type; "thread_id" is rejected with 99992402 field-validation-failed
+            # (verified against the live API: a bogus thread_id gives 99992402, while a bogus
+            # chat_id gives 230001 invalid receive_id — so the *type* is the invalid field).
+            # That silently dropped every anchorless send into a topic: auto-resume after a
+            # gateway restart, goal continuations, queued-lane finals, captioned media.
+            # Anchor on the topic's latest message through the reply API instead (the same
+            # route the audio/image paths use); fall back to the chat when unreadable.
+            anchor = await self._fetch_last_message_in_thread(thread_id)
+            if anchor:
+                response = await self._reply_in_thread(anchor, msg_type=msg_type, payload=payload)
+                if self._response_succeeded(response):
+                    return response
+                if getattr(response, "code", None) in _FEISHU_REPLY_FALLBACK_CODES:
+                    # The anchor was withdrawn/deleted between the lookup and the reply, so
+                    # nothing was delivered: re-anchor on the next newest message and retry once.
+                    retry_anchor = await self._fetch_last_message_in_thread(thread_id, exclude=anchor)
+                    if retry_anchor:
+                        response = await self._reply_in_thread(retry_anchor, msg_type=msg_type, payload=payload)
+                        if self._response_succeeded(response):
+                            return response
+                logger.warning(
+                    "[Feishu] Topic %s anchor reply rejected (code=%s); sending to chat %s without topic routing",
+                    thread_id, getattr(response, "code", None), chat_id,
+                )
+            else:
+                logger.warning(
+                    "[Feishu] Topic %s has no readable anchor; sending to chat %s without topic routing",
+                    thread_id, chat_id,
+                )
+        if chat_id.startswith("feishu_user_id:"):
             receive_id, receive_id_type = chat_id.split(":", 1)[1], "user_id"
         else:
             receive_id, receive_id_type = chat_id, "open_id" if chat_id.startswith("ou_") else "chat_id"

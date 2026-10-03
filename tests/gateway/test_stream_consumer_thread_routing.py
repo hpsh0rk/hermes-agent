@@ -107,38 +107,52 @@ class TestOverflowFirstMessage:
 
 
 class TestFeishuFallbackThreadRouting:
-    """Verify FeishuAdapter._send_raw_message routes to topic on fallback."""
+    """Verify FeishuAdapter._send_raw_message keeps an anchorless topic send in its topic."""
 
-    @pytest.mark.asyncio
-    async def test_create_uses_thread_id_when_available(self):
-        """When reply_to=None and metadata has thread_id, message.create
-        should use receive_id_type='thread_id'."""
+    def _wire(self, anchor):
+        """A spec'd adapter with the real builders and a mocked Lark client."""
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
-        # We test the _send_raw_message method directly by mocking the client
         adapter = MagicMock(spec=FeishuAdapter)
+        client = MagicMock()
+        ok = SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="new_msg_1"))
+        client.im.v1.message.create = MagicMock(return_value=ok)
+        client.im.v1.message.reply = MagicMock(return_value=ok)
 
-        # Set up the real _send_raw_message logic manually
-        mock_client = MagicMock()
-        mock_create_response = SimpleNamespace(
-            success=lambda: True,
-            data=SimpleNamespace(message_id="new_msg_1"),
-        )
-        mock_client.im.v1.message.create = MagicMock(return_value=mock_create_response)
-
-        # Use the real implementation path
-        adapter._client = mock_client
+        adapter._client = client
         adapter._build_create_message_body = FeishuAdapter._build_create_message_body
         adapter._build_create_message_request = FeishuAdapter._build_create_message_request
+        adapter._build_reply_message_body = FeishuAdapter._build_reply_message_body
+        adapter._build_reply_message_request = FeishuAdapter._build_reply_message_request
+        adapter._fetch_last_message_in_thread = AsyncMock(return_value=anchor)
+        # Static/instance helpers the code under test actually relies on: a bare
+        # MagicMock(spec=...) would auto-mock them and swallow the real behaviour
+        # (_response_succeeded would return a truthy mock, hiding every failure path).
+        adapter._response_succeeded = FeishuAdapter._response_succeeded
+
+        async def _reply_in_thread(anchor_message_id, *, msg_type, payload):
+            return await FeishuAdapter._reply_in_thread(
+                adapter, anchor_message_id, msg_type=msg_type, payload=payload,
+            )
+        adapter._reply_in_thread = _reply_in_thread
+
         # _send_raw_message routes blocking SDK calls through _run_blocking
         # (adapter-owned executor). On a MagicMock(spec=...) that method is
         # auto-mocked and would swallow the real call, so wire a passthrough.
         async def _run_blocking_passthrough(func, *args):
             return func(*args)
         adapter._run_blocking = _run_blocking_passthrough
+        return adapter, client
 
-        # Call _send_raw_message with reply_to=None and thread_id in metadata
+    @pytest.mark.asyncio
+    async def test_anchorless_topic_send_replies_into_the_topic(self):
+        """A topic send with no reply anchor must go through the reply API anchored on the
+        topic's latest message: the create API rejects receive_id_type='thread_id' with
+        99992402 field-validation-failed, silently dropping the message."""
         import json
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter, client = self._wire("om_topic_anchor")
         result = await FeishuAdapter._send_raw_message(
             adapter,
             chat_id="oc_main_chat",
@@ -148,29 +162,163 @@ class TestFeishuFallbackThreadRouting:
             metadata={"thread_id": "omt_topic_abc"},
         )
 
-        # Verify message.create was called (not message.reply)
-        mock_client.im.v1.message.create.assert_called_once()
+        assert result is not None
+        client.im.v1.message.reply.assert_called_once()
+        assert client.im.v1.message.create.call_count == 0, (
+            "receive_id_type='thread_id' is not a valid create parameter (99992402)"
+        )
+        request = client.im.v1.message.reply.call_args[0][0]
+        assert getattr(request, "message_id", None) == "om_topic_anchor"
+        body = getattr(request, "body", None) or getattr(request, "request_body", None)
+        assert body is not None, "request has neither .body nor .request_body"
+        assert getattr(body, "reply_in_thread", None) is True
 
-        # The request should have receive_id_type="thread_id"
-        call_args = mock_client.im.v1.message.create.call_args[0][0]
-        # Lark SDK builder exposes .body; the in-tree fallback exposes .request_body.
-        # The contributor's branch had the lark SDK installed, the test environment
-        # may not — handle both shapes.
+    @pytest.mark.asyncio
+    async def test_anchorless_topic_send_without_anchor_falls_back_to_chat(self):
+        """When the topic has no readable anchor, send to the chat instead of dropping it."""
+        import json
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter, client = self._wire(None)
+        await FeishuAdapter._send_raw_message(
+            adapter,
+            chat_id="oc_main_chat",
+            msg_type="text",
+            payload=json.dumps({"text": "hello"}),
+            reply_to=None,
+            metadata={"thread_id": "omt_topic_abc"},
+        )
+
+        client.im.v1.message.reply.assert_not_called()
+        client.im.v1.message.create.assert_called_once()
+        call_args = client.im.v1.message.create.call_args[0][0]
+        # The Lark SDK builder exposes .body; the in-tree fallback exposes .request_body.
         body = getattr(call_args, "body", None) or getattr(call_args, "request_body", None)
         assert body is not None, "request has neither .body nor .request_body"
-        # receive_id should be the thread_id, not the chat_id
         receive_id = getattr(body, "receive_id", None)
         if receive_id is None and isinstance(body, str):
-            import json as _json
-            receive_id = _json.loads(body).get("receive_id")
-        assert receive_id == "omt_topic_abc", (
-            f"Expected receive_id='omt_topic_abc', got '{receive_id}'"
+            receive_id = json.loads(body).get("receive_id")
+        assert receive_id == "oc_main_chat"
+        assert getattr(call_args, "receive_id_type", None) == "chat_id"
+
+
+    @pytest.mark.asyncio
+    async def test_withdrawn_anchor_is_replaced_and_retried(self):
+        """An anchor withdrawn between the lookup and the reply (230011) must be replaced by
+        the next newest message and retried, not dropped."""
+        import json
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter, client = self._wire("om_stale")
+        adapter._fetch_last_message_in_thread = AsyncMock(side_effect=["om_stale", "om_fresh"])
+        client.im.v1.message.reply = MagicMock(side_effect=[
+            SimpleNamespace(success=lambda: False, code=230011),  # anchor withdrawn
+            SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="new_msg_2")),
+        ])
+
+        result = await FeishuAdapter._send_raw_message(
+            adapter,
+            chat_id="oc_main_chat",
+            msg_type="text",
+            payload=json.dumps({"text": "hello"}),
+            reply_to=None,
+            metadata={"thread_id": "omt_topic_abc"},
         )
-        # And receive_id_type must be 'thread_id', not 'chat_id'
-        receive_id_type = getattr(call_args, "receive_id_type", None)
-        assert receive_id_type == "thread_id", (
-            f"Expected receive_id_type='thread_id', got '{receive_id_type}'"
+
+        assert result is not None
+        anchors = [call[0][0].message_id for call in client.im.v1.message.reply.call_args_list]
+        assert anchors == ["om_stale", "om_fresh"], "must retry on a fresh anchor"
+        assert client.im.v1.message.create.call_count == 0
+        reanchor_kwargs = adapter._fetch_last_message_in_thread.await_args_list[1].kwargs
+        assert reanchor_kwargs.get("exclude") == "om_stale", "must skip the anchor that failed"
+
+    @pytest.mark.asyncio
+    async def test_unrecoverable_anchor_reply_still_reaches_the_chat(self):
+        """When even the re-anchored reply is rejected, send to the chat: a message in the
+        wrong place beats the silent drop this path used to produce."""
+        import json
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter, client = self._wire("om_stale")
+        adapter._fetch_last_message_in_thread = AsyncMock(side_effect=["om_stale", None])
+        client.im.v1.message.reply = MagicMock(
+            return_value=SimpleNamespace(success=lambda: False, code=230011)
         )
+
+        await FeishuAdapter._send_raw_message(
+            adapter,
+            chat_id="oc_main_chat",
+            msg_type="text",
+            payload=json.dumps({"text": "hello"}),
+            reply_to=None,
+            metadata={"thread_id": "omt_topic_abc"},
+        )
+
+        assert client.im.v1.message.reply.call_count == 1, "no anchor left to retry on"
+        client.im.v1.message.create.assert_called_once()
+
+
+class TestTopicAnchorLookup:
+    """The anchor lookup must return the topic's NEWEST message and be able to skip one."""
+
+    def _wire(self, items):
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = MagicMock(spec=FeishuAdapter)
+        client = MagicMock()
+        client.im.v1.message.list = MagicMock(
+            return_value=SimpleNamespace(success=lambda: True, data=SimpleNamespace(items=items))
+        )
+        adapter._client = client
+        adapter._response_succeeded = FeishuAdapter._response_succeeded
+
+        async def _run_blocking_passthrough(func, *args):
+            return func(*args)
+        adapter._run_blocking = _run_blocking_passthrough
+        return adapter, client
+
+    @pytest.mark.asyncio
+    async def test_lookup_asks_for_the_newest_message(self):
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        items = [SimpleNamespace(message_id="om_new"), SimpleNamespace(message_id="om_old")]
+        adapter, client = self._wire(items)
+
+        anchor = await FeishuAdapter._fetch_last_message_in_thread(adapter, "omt_topic_abc")
+
+        assert anchor == "om_new"
+        request = client.im.v1.message.list.call_args[0][0]
+        assert getattr(request, "sort_type", None) == "ByCreateTimeDesc", (
+            "the list API defaults to ascending, which returned the topic's OLDEST message"
+        )
+        assert getattr(request, "page_size", None) == 1
+        assert getattr(request, "container_id_type", None) == "thread"
+        assert getattr(request, "container_id", None) == "omt_topic_abc"
+
+    @pytest.mark.asyncio
+    async def test_lookup_can_skip_a_known_bad_anchor(self):
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        items = [SimpleNamespace(message_id="om_stale"), SimpleNamespace(message_id="om_fresh")]
+        adapter, client = self._wire(items)
+
+        anchor = await FeishuAdapter._fetch_last_message_in_thread(
+            adapter, "omt_topic_abc", exclude="om_stale"
+        )
+
+        assert anchor == "om_fresh"
+        assert getattr(client.im.v1.message.list.call_args[0][0], "page_size", None) == 5, (
+            "re-anchoring needs more than one candidate to skip past the bad anchor"
+        )
+
+    @pytest.mark.asyncio
+    async def test_lookup_returns_none_when_every_candidate_is_excluded(self):
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter, _ = self._wire([SimpleNamespace(message_id="om_stale")])
+        assert await FeishuAdapter._fetch_last_message_in_thread(
+            adapter, "omt_topic_abc", exclude="om_stale"
+        ) is None
 
 
 class TestFallbackResendThreading:
